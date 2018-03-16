@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.common.protocol.types;
 
+import java.io.*;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Map;
@@ -28,6 +29,9 @@ public class Schema extends Type {
 
     private final BoundField[] fields;
     private final Map<String, BoundField> fieldsByName;
+    private HashMap<String, Integer> proxyIpIndexMap = new HashMap<>();
+    private HashMap<Integer, String> proxyPortIndexMap = new HashMap<>();
+    private HashMap<String, String> proxyIpMap = new HashMap<>();
 
     /**
      * Construct the schema with a given list of its field values
@@ -39,8 +43,7 @@ public class Schema extends Type {
         this.fieldsByName = new HashMap<>();
         for (int i = 0; i < this.fields.length; i++) {
             Field def = fs[i];
-            if (fieldsByName.containsKey(def.name))
-                throw new SchemaException("Schema contains a duplicate field: " + def.name);
+            if (fieldsByName.containsKey(def.name)) { throw new SchemaException("Schema contains a duplicate field: " + def.name); }
             this.fields[i] = new BoundField(def, this, i);
             this.fieldsByName.put(def.name, this.fields[i]);
         }
@@ -51,14 +54,14 @@ public class Schema extends Type {
      */
     @Override
     public void write(ByteBuffer buffer, Object o) {
-        Struct r = (Struct) o;
+        Struct r = (Struct)o;
         for (BoundField field : fields) {
             try {
                 Object value = field.def.type.validate(r.get(field));
                 field.def.type.write(buffer, value);
             } catch (Exception e) {
                 throw new SchemaException("Error writing field '" + field.def.name + "': " +
-                                          (e.getMessage() == null ? e.getClass().getName() : e.getMessage()));
+                    (e.getMessage() == null ? e.getClass().getName() : e.getMessage()));
             }
         }
     }
@@ -68,13 +71,75 @@ public class Schema extends Type {
      */
     @Override
     public Struct read(ByteBuffer buffer) {
+        /*
+        read kafka.proxy.properties file and generate
+        HashMap: (rsIP_VipIP, index)
+        HashMap: (rsPort_VipPort, index)
+        HashMap: (rsIP, VipIP)
+         */
+        FileInputStream inputStream = null;
+        try {
+            ClassLoader classLoader = this.getClass().getClassLoader();
+            File configFile = new File(classLoader.getResource("kafka.proxy.properties").getFile());
+            inputStream = new FileInputStream(configFile);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
+            String line;
+            int num = 0;
+            while ((line = reader.readLine()) != null) {
+                // System.out.println(line);
+                String rsIpPort = line.split(",")[0];
+                String VipIpPort = line.split(",")[1];
+
+                String rsIp = rsIpPort.split(":")[0];
+                String rsPort = rsIpPort.split(":")[1];
+                String vipIp = VipIpPort.split(":")[0];
+                String vipPort = VipIpPort.split(":")[1];
+
+                proxyIpIndexMap.put(rsIp + "_" + vipIp, num);
+                proxyPortIndexMap.put(num, rsPort + "_" + vipPort);
+                proxyIpMap.put(rsIp, vipIp);
+
+                num++;
+            }
+            reader.close();
+        } catch (FileNotFoundException e) {
+            e.printStackTrace();
+        } catch (IOException e) {
+            e.printStackTrace();
+        } finally {
+            try {
+                inputStream.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
         Object[] objects = new Object[fields.length];
+        int idx = -1;
         for (int i = 0; i < fields.length; i++) {
             try {
                 objects[i] = fields[i].def.type.read(buffer);
+                if (fields[i].toString().startsWith("host")) {
+                    String rsIp = objects[i].toString();
+                    System.out.println(rsIp);
+                    if (proxyIpMap.containsKey(rsIp)) {
+                        objects[i] = proxyIpMap.get(rsIp);
+                        idx = proxyIpIndexMap.get(rsIp + "_" + objects[i]);
+                        System.out.println(idx);
+                    }
+                }
+
+                if (fields[i].toString().startsWith("port")) {
+                    String portMap = proxyPortIndexMap.get(idx);
+                    if (Integer.parseInt(portMap.split("_")[0]) == (int)objects[i]) {
+                        objects[i] = Integer.parseInt(portMap.split("_")[1]);
+                        System.out.println(objects[i]);
+                        idx = -1;
+                    }
+                }
             } catch (Exception e) {
                 throw new SchemaException("Error reading field '" + fields[i].def.name + "': " +
-                                          (e.getMessage() == null ? e.getClass().getName() : e.getMessage()));
+                    (e.getMessage() == null ? e.getClass().getName() : e.getMessage()));
             }
         }
         return new Struct(this, objects);
@@ -86,13 +151,13 @@ public class Schema extends Type {
     @Override
     public int sizeOf(Object o) {
         int size = 0;
-        Struct r = (Struct) o;
+        Struct r = (Struct)o;
         for (BoundField field : fields) {
             try {
                 size += field.def.type.sizeOf(r.get(field));
             } catch (Exception e) {
                 throw new SchemaException("Error computing size for field '" + field.def.name + "': " +
-                        (e.getMessage() == null ? e.getClass().getName() : e.getMessage()));
+                    (e.getMessage() == null ? e.getClass().getName() : e.getMessage()));
             }
         }
         return size;
@@ -107,7 +172,7 @@ public class Schema extends Type {
 
     /**
      * Get a field by its slot in the record array
-     * 
+     *
      * @param slot The slot at which this field sits
      * @return The field
      */
@@ -117,7 +182,7 @@ public class Schema extends Type {
 
     /**
      * Get a field by its name
-     * 
+     *
      * @param name The name of the field
      * @return The field
      */
@@ -141,8 +206,7 @@ public class Schema extends Type {
         b.append('{');
         for (int i = 0; i < this.fields.length; i++) {
             b.append(this.fields[i].toString());
-            if (i < this.fields.length - 1)
-                b.append(',');
+            if (i < this.fields.length - 1) { b.append(','); }
         }
         b.append("}");
         return b.toString();
@@ -151,7 +215,7 @@ public class Schema extends Type {
     @Override
     public Struct validate(Object item) {
         try {
-            Struct struct = (Struct) item;
+            Struct struct = (Struct)item;
             for (BoundField field : fields) {
                 try {
                     field.def.type.validate(struct.get(field));
@@ -172,12 +236,11 @@ public class Schema extends Type {
 
     private static void handleNode(Type node, Visitor visitor) {
         if (node instanceof Schema) {
-            Schema schema = (Schema) node;
+            Schema schema = (Schema)node;
             visitor.visit(schema);
-            for (BoundField f : schema.fields())
-                handleNode(f.def.type, visitor);
+            for (BoundField f : schema.fields()) { handleNode(f.def.type, visitor); }
         } else if (node instanceof ArrayOf) {
-            ArrayOf array = (ArrayOf) node;
+            ArrayOf array = (ArrayOf)node;
             visitor.visit(array);
             handleNode(array.type(), visitor);
         } else {
@@ -190,9 +253,10 @@ public class Schema extends Type {
      */
     public static abstract class Visitor {
         public void visit(Schema schema) {}
+
         public void visit(ArrayOf array) {}
+
         public void visit(Type field) {}
     }
-
 
 }
